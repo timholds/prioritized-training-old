@@ -3,3 +3,4 @@ pt-env/
 qmnist-the-extended-mnist-dataset-120k-images/
 requirements.txt
 __pycache__/
+.git/
