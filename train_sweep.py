@@ -9,6 +9,10 @@ import psutil
 import threading
 import time
 
+from queue import Queue
+from multiprocessing.pool import ThreadPool
+
+
 from tensorflow import keras
 from tensorflow.keras import backend as K
 from tensorflow.keras import layers
@@ -104,6 +108,44 @@ def shuffle_train_set_with_idx(x, y):
     image_label_dict_shuffled = {key: image_label_dict[key] for key in keys}
     
     return image_label_dict_shuffled
+
+def load_batch_into_queue(model, image_label_dict_shuffled, q, i, batch_size, null_hypothesis):
+    print('starting putting batch into queue {} to {}'.format(i, i+batch_size))
+    t0 = time.time()
+    idxs               = [i[0]      for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
+    x_batch_candidates = [i[1]['x'] for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
+    y_batch_candidates = [i[1]['y'] for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
+
+    if null_hypothesis:
+        x_batch = np.array([image_label_dict_shuffled[x]['x'] for x in range(i, i+small_batch_size)])
+        y_batch = np.array([image_label_dict_shuffled[x]['y'] for x in range(i, i+small_batch_size)])
+    else:
+        # # Evaluate the current model against the candidate batch and make a dict of frame idx: loss value
+        #cur_candidate_loss_dict = eval_cur_model_on_batch(conv_model, x_batch_candidates, y_batch_candidates, idxs)
+        preds = model.predict(np.array(x_batch_candidates), batch_size=small_batch_size, use_multiprocessing=True)
+        loss_vals = categorical_crossentropy(preds, y_batch_candidates).numpy()
+        cur_model_batch_loss_dict = {}
+        for idx, loss_val in list(zip(idxs, loss_vals)):
+            cur_model_batch_loss_dict[idx] = loss_val
+    
+        # Calculate RHO loss using the frame indices in both training loss dict and IL loss dict
+        rho_loss = {}
+        for frame_idx in cur_model_batch_loss_dict.keys():
+            rho_loss[frame_idx] = cur_model_batch_loss_dict[frame_idx] - il_model_loss_dict[frame_idx]
+
+        # Select the training batch using using the frames with highest RHO loss
+        rho_loss_sorted = sorted(rho_loss.items(), key=lambda x: x[1])
+        frame_idxs = [x[0] for x in rho_loss_sorted]
+
+        # Select the training batch using the indices of the ideal frames from the subbatch
+        x_batch = np.array([image_label_dict_shuffled[x]['x'] for x in frame_idxs])
+        y_batch = np.array([image_label_dict_shuffled[x]['y'] for x in frame_idxs])
+
+
+    q.put([x_batch, y_batch])
+    t1 = time.time()
+    print('took {}s to put batch into queue {} to {}'.format(t1-t0, i, i+batch_size))
+    return q
 
 def log_util_usage():
     print('\n *** logging utility usage ***\n')
@@ -210,36 +252,54 @@ def train_prioritized_conv(x_train, y_train, x_test, y_test, il_model_loss_dict,
         batch_train_accuracies, batch_train_losses, batch_train_mse, batch_train_cce = [], [], [], []
         image_label_dict_shuffled = shuffle_train_set_with_idx(x_train, y_train)
 
+        pool = ThreadPool(processes=1)
+        q = Queue(maxsize=1)
+        
         i = 0
         while i + big_batch_size <= len(image_label_dict_shuffled):
-            idxs               = [i[0]      for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
-            x_batch_candidates = [i[1]['x'] for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
-            y_batch_candidates = [i[1]['y'] for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
-
-            if null_hypothesis:
-                x_batch = np.array([image_label_dict_shuffled[x]['x'] for x in range(i, i+small_batch_size)])
-                y_batch = np.array([image_label_dict_shuffled[x]['y'] for x in range(i, i+small_batch_size)])
+            if i == 0:
+                async_result = pool.apply_async(load_batch_into_queue, (model, image_label_dict_shuffled, q, i, big_batch_size, null_hypothesis))
+                x_batch, y_batch = async_result.get().get() # get() results of load_batch_into_queue (a queue), and get() batch from queue
+                async_result = pool.apply_async(load_batch_into_queue, (model, image_label_dict_shuffled, q, i + big_batch_size, big_batch_size, null_hypothesis))
+                hist = model.fit(x_batch, y_batch, epochs=1, steps_per_epoch=small_batch_size, verbose=1, shuffle=False)
+                x_next, y_next  = async_result.get().get() # first get retrieves result (a queue) from load_batch_into_queue, 2nd gets items from queue
             else:
-                # # Evaluate the current model against the candidate batch and make a dict of frame idx: loss value
-                #cur_candidate_loss_dict = eval_cur_model_on_batch(conv_model, x_batch_candidates, y_batch_candidates, idxs)
-                preds = model.predict(np.array(x_batch_candidates), batch_size=small_batch_size, use_multiprocessing=True)
-                loss_vals = categorical_crossentropy(preds, y_batch_candidates).numpy()
-                cur_model_batch_loss_dict = {}
-                for idx, loss_val in list(zip(idxs, loss_vals)):
-                    cur_model_batch_loss_dict[idx] = loss_val
+                x_batch = x_next
+                y_batch = y_next
+                async_result = pool.apply_async(load_batch_into_queue, (model, image_label_dict_shuffled, q, i, big_batch_size, null_hypothesis))
             
-                # Calculate RHO loss using the frame indices in both training loss dict and IL loss dict
-                rho_loss = {}
-                for frame_idx in cur_model_batch_loss_dict.keys():
-                    rho_loss[frame_idx] = cur_model_batch_loss_dict[frame_idx] - il_model_loss_dict[frame_idx]
+                hist = model.fit(x_batch, y_batch, epochs=1, steps_per_epoch=small_batch_size, verbose=1, shuffle=False)
 
-                # Select the training batch using using the frames with highest RHO loss
-                rho_loss_sorted = sorted(rho_loss.items(), key=lambda x: x[1])
-                frame_idxs = [x[0] for x in rho_loss_sorted]
+                x_next, y_next = async_result.get().get()
+            
+            # idxs               = [i[0]      for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
+            # x_batch_candidates = [i[1]['x'] for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
+            # y_batch_candidates = [i[1]['y'] for i in list(image_label_dict_shuffled.items())[i : i + big_batch_size]]
 
-                # Select the training batch using the indices of the ideal frames from the subbatch
-                x_batch = np.array([image_label_dict_shuffled[x]['x'] for x in frame_idxs])
-                y_batch = np.array([image_label_dict_shuffled[x]['y'] for x in frame_idxs])
+            # if null_hypothesis:
+            #     x_batch = np.array([image_label_dict_shuffled[x]['x'] for x in range(i, i+small_batch_size)])
+            #     y_batch = np.array([image_label_dict_shuffled[x]['y'] for x in range(i, i+small_batch_size)])
+            # else:
+            #     # # Evaluate the current model against the candidate batch and make a dict of frame idx: loss value
+            #     #cur_candidate_loss_dict = eval_cur_model_on_batch(conv_model, x_batch_candidates, y_batch_candidates, idxs)
+            #     preds = model.predict(np.array(x_batch_candidates), batch_size=small_batch_size, use_multiprocessing=True)
+            #     loss_vals = categorical_crossentropy(preds, y_batch_candidates).numpy()
+            #     cur_model_batch_loss_dict = {}
+            #     for idx, loss_val in list(zip(idxs, loss_vals)):
+            #         cur_model_batch_loss_dict[idx] = loss_val
+            
+            #     # Calculate RHO loss using the frame indices in both training loss dict and IL loss dict
+            #     rho_loss = {}
+            #     for frame_idx in cur_model_batch_loss_dict.keys():
+            #         rho_loss[frame_idx] = cur_model_batch_loss_dict[frame_idx] - il_model_loss_dict[frame_idx]
+
+            #     # Select the training batch using using the frames with highest RHO loss
+            #     rho_loss_sorted = sorted(rho_loss.items(), key=lambda x: x[1])
+            #     frame_idxs = [x[0] for x in rho_loss_sorted]
+
+            #     # Select the training batch using the indices of the ideal frames from the subbatch
+            #     x_batch = np.array([image_label_dict_shuffled[x]['x'] for x in frame_idxs])
+            #     y_batch = np.array([image_label_dict_shuffled[x]['y'] for x in frame_idxs])
 
 
             # Shuffle is false because we already shuffled the data
@@ -267,16 +327,20 @@ def train_prioritized_conv(x_train, y_train, x_test, y_test, il_model_loss_dict,
         val_cce       .append(val_hist['categorical_crossentropy'])
   
     t1 = time.time()
+    train_time = t1 - t0
     #print('took {} seconds'.format(t1 - t0))
     train_val_dict = {}
     train_val_dict['val'] = {'accuracy': val_accuracies , 
                                 'loss': val_losses, 
                                 'mse': val_mse,
-                                'cce': val_cce}
+                                'cce': val_cce,
+                                'time': train_time}
+
     train_val_dict['train']   = {'accuracy':train_accuracies ,
                                 'loss':train_losses ,
                                 'mse': train_mse_list,
-                                'cce': train_cce_list}
+                                'cce': train_cce_list,
+                                'time': train_time}
 
     return train_val_dict
 
@@ -312,7 +376,8 @@ if __name__ == '__main__':
     num_classes = len(set(labels.flatten()))
     (x_train, y_train), (x_test, y_test), (x_holdout, y_holdout) = prep_data(images, labels, num_classes=10)
     
-    big_batch_sizes = [10000, 5000, 2560, 1280, 640]
+    # big_batch_sizes = [10000, 5000, 2560, 1280, 640, 448]
+    big_batch_sizes = [10000]#, 128, 72]
     small_batch_size = 64
     epochs = 10
     
@@ -320,6 +385,7 @@ if __name__ == '__main__':
     holdout_model = ConvModel()
     holdout_model = holdout_model.create_model()
     holdout_model = compile_model(holdout_model, loss='categorical_crossentropy')
+    print('\n *** Fitting Holdout Model ***\n')
     fit(holdout_model, x_holdout, y_holdout, batch_size = small_batch_size, epochs=epochs, verbose=1, shuffle=True)
     
     # Step 2: Get Irreducible losses for the holdout model on the training set --> do __before__ shuffling data
@@ -341,7 +407,7 @@ if __name__ == '__main__':
         prioritized_training_metrics_classification[big_batch_size] = classif_metrics
 
     dataset_fn = 'data-{}-epochs.json'.format(epochs)
-    with open('data-1.json', 'w', encoding='utf-8') as f:
+    with open(dataset_fn, 'w', encoding='utf-8') as f:
         json.dump([{'Null Hypothesis Regression'         : null_hypot_metrics_regression}, 
                   {'Prioritized Training Regression'    : prioritized_training_metrics_regression},
                   {'Null Hypothesis Classification'     : null_hypot_metrics_classification},
@@ -356,19 +422,10 @@ if __name__ == '__main__':
         # json.dump({'Prioritized Training Classification': prioritized_training_metrics_classification}, f, ensure_ascii=False, indent=4)
 
     t1 = time.time()
-    print('took {} in total to run over {} big_batch_sizes'.format(str(datetime.time(seconds=t1 - t0)), len(big_batch_size)))
+    print('took {} in total to run over {} big_batch_sizes'.format(str(datetime.time(t1 - t0)), len(big_batch_size)))
 
     import pdb; pdb.set_trace()
 
-    def read_json():
-        with open('data.json', 'r', encoding='utf-8') as f:
-            data = json.loads(f)
-            print(data)
-            # for line in f.readlines():
-            #     print(line)
-
-            print('***')
-            print(f.readlines)
     
     
     
